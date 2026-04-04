@@ -6,11 +6,19 @@ on:
     branches: main
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test-msrv:
     name: Test MSRV on ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         name: [linux, linux-aarch64, windows, macos]
         include:
@@ -31,12 +39,13 @@ jobs:
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: sudo apt install ${{ matrix.build_deps }}
         if: matrix.build_deps != ''
       - uses: dtolnay/rust-toolchain@stable
         id: stable-toolchain
+      - uses: Swatinem/rust-cache@v2
       - name: Install test dependencies using latest stable Rust
         run: cargo +${{steps.stable-toolchain.outputs.name}} install rage
       - name: Run tests
@@ -48,6 +57,7 @@ jobs:
     name: Test latest stable on ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         name: [linux, linux-aarch64, windows, macos]
         include:
@@ -68,14 +78,14 @@ jobs:
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: sudo apt install ${{ matrix.build_deps }}
         if: matrix.build_deps != ''
       - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@stable
         id: toolchain
       - run: rustup override set ${{steps.toolchain.outputs.name}}
+      - uses: Swatinem/rust-cache@v2
       - name: Install test dependencies
         run: cargo install rage
       - name: Remove lockfile to build with latest dependencies
@@ -93,7 +103,7 @@ jobs:
       options: --security-opt seccomp=unconfined
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: apt update && apt install -y libpcsclite-dev
       - name: Generate coverage report
@@ -103,7 +113,7 @@ jobs:
           --timeout 180
           --out xml
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4.5.0
+        uses: codecov/codecov-action@v5
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -112,9 +122,10 @@ jobs:
     name: Intra-doc links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: sudo apt install libpcsclite-dev
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fetch
       # Requires #![deny(rustdoc::broken_intra_doc_links)] in crates.
       - name: Check intra-doc links
@@ -124,6 +135,6 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check formatting
         run: cargo fmt -- --check

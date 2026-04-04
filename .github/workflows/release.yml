@@ -11,11 +11,15 @@ on:
         required: true
         default: 'true'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Publish for ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         name:
           - linux
@@ -74,13 +78,16 @@ jobs:
             asset_suffix: x86_64-darwin.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         id: toolchain
       - run: rustup override set ${{steps.toolchain.outputs.name}}
       - name: Add target
         run: rustup target add ${{ matrix.target }}
         if: matrix.target != ''
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Install linux build dependencies
         run: sudo apt install ${{ matrix.build_deps }}
@@ -89,9 +96,24 @@ jobs:
       - name: Install armv7 cross-compilation toolchain
         run: |
           sudo dpkg --add-architecture armhf
-          sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list || true
+
+          # Fix DEB822-format sources (Ubuntu 24.04+) to only fetch amd64
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/^Architectures:.*/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+            # If no Architectures line exists, add one after each "Types:" line
+            if ! grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources; then
+              sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+          fi
+
+          # Also handle traditional format sources if any exist
+          sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+          # Add armhf sources from ports.ubuntu.com
           echo "deb [arch=armhf] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/armhf.list
           echo "deb [arch=armhf] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/armhf.list
+          echo "deb [arch=armhf] http://ports.ubuntu.com/ $(lsb_release -cs)-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/armhf.list
+
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf libpcsclite-dev:armhf
           mkdir -p .cargo
@@ -102,12 +124,6 @@ jobs:
         if: matrix.name == 'linux-armv7'
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
-
-      - name: Set up .cargo/config
-        run: |
-          mkdir -p .cargo
-          echo '${{ matrix.cargo_config }}' >.cargo/config
-        if: matrix.cargo_config != ''
 
       - name: cargo build
         run: cargo build --release --locked ${{ matrix.build_flags }}
@@ -147,6 +163,7 @@ jobs:
     name: Debian ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         name: [linux, linux-aarch64]
         include:
@@ -163,42 +180,30 @@ jobs:
               libpcsclite-dev
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         id: toolchain
       - run: rustup override set ${{steps.toolchain.outputs.name}}
       - name: Add target
         run: rustup target add ${{ matrix.target }}
-      - name: cargo install cargo-deb
-        uses: actions-rs/cargo@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: install
-          args: cargo-deb
+          key: deb-${{ matrix.name }}
+      - name: cargo install cargo-deb
+        run: cargo install cargo-deb
 
       - name: Install build dependencies
         run: sudo apt install ${{ matrix.build_deps }}
         if: matrix.build_deps != ''
 
-      - name: Set up .cargo/config
-        run: |
-          mkdir .cargo
-          echo '${{ matrix.cargo_config }}' >.cargo/config
-        if: matrix.cargo_config != ''
-
       - name: cargo build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.build_flags }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Generate manpages
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: --example generate-docs
+        run: cargo run --example generate-docs
 
       - name: cargo deb
-        uses: actions-rs/cargo@v1
-        with:
-          command: deb
-          args: --package age-plugin-yubikey --no-build --target ${{ matrix.target }}
+        run: cargo deb --package age-plugin-yubikey --no-build --target ${{ matrix.target }}
 
       - name: Upload Debian package to release
         uses: svenstaro/upload-release-action@2.9.0
