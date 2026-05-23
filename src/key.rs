@@ -1,16 +1,20 @@
 //! Structs for handling YubiKeys.
 
+use age_core::primitives::bech32_encode;
 use age_core::secrecy::{ExposeSecret, SecretString};
 use age_plugin::{identity, Callbacks};
-use bech32::{ToBase32, Variant};
 use dialoguer::Password;
 use log::{debug, error, warn};
 use std::convert::Infallible;
+use std::env;
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
 use std::iter;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
+use x509_parser::der_parser::oid::Oid;
 use yubikey::{
     certificate::Certificate,
     piv::{decrypt_data, AlgorithmId, RetiredSlotId, SlotId},
@@ -20,14 +24,18 @@ use yubikey::{
 
 use crate::{
     error::Error,
-    fl, piv_p256,
+    fl,
+    native::p256tag,
     recipient::TAG_BYTES,
-    util::{otp_serial_prefix, Metadata},
+    util::{otp_serial_prefix, Metadata, POLICY_EXTENSION_OID},
     Recipient, IDENTITY_PREFIX,
 };
 
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const FIFTEEN_SECONDS: Duration = Duration::from_secs(15);
+
+/// The set of OIDs that we understand and use when parsing YubiKey slot certificates.
+const KNOWN_OIDS: &[&[u64]] = &[POLICY_EXTENSION_OID];
 
 pub(crate) fn is_connected(reader: Reader) -> bool {
     filter_connected(&reader)
@@ -252,6 +260,67 @@ pub(crate) fn open(serial: Option<Serial>) -> Result<YubiKey, Error> {
     Ok(yubikey)
 }
 
+/// Sends a request to the SSH agent to trigger reconnection to the YubiKey.
+///
+/// This function sends an `SSH_AGENTC_REQUEST_IDENTITIES` (opcode 11) message to the
+/// SSH agent socket specified by the `SSH_AUTH_SOCK` environment variable. This triggers
+/// agents like `yubikey-agent` to reconnect to the YubiKey on-demand, preserving PIN
+/// cache state.
+///
+/// All errors are silently ignored to avoid affecting the main encryption/decryption
+/// workflow.
+#[cfg(unix)]
+fn poke_ssh_agent() {
+    // Get SSH_AUTH_SOCK; silently return if not set
+    let socket_path = match env::var("SSH_AUTH_SOCK") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return,
+    };
+
+    // Connect to the SSH agent socket
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Failed to connect to SSH agent socket: {}", e);
+            return;
+        }
+    };
+
+    // Set a short timeout to avoid blocking
+    let timeout = Some(Duration::from_secs(1));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+
+    // SSH_AGENTC_REQUEST_IDENTITIES message:
+    // - 4 bytes: message length (big-endian) = 1
+    // - 1 byte: message type = 11 (SSH_AGENTC_REQUEST_IDENTITIES)
+    const SSH_AGENTC_REQUEST_IDENTITIES: [u8; 5] = [0, 0, 0, 1, 11];
+
+    if let Err(e) = stream.write_all(&SSH_AGENTC_REQUEST_IDENTITIES) {
+        debug!("Failed to send request to SSH agent: {}", e);
+        return;
+    }
+
+    // Read and discard the response (we don't need the identities list)
+    // Response format: 4-byte length + message body
+    let mut length_buf = [0u8; 4];
+    if stream.read_exact(&mut length_buf).is_ok() {
+        let length = u32::from_be_bytes(length_buf) as usize;
+        // Limit read to prevent memory issues with malformed responses
+        if length <= 64 * 1024 {
+            let mut response = vec![0u8; length];
+            let _ = stream.read_exact(&mut response);
+        }
+    }
+
+    debug!("Sent reconnection trigger to SSH agent at {}", socket_path);
+}
+
+#[cfg(not(unix))]
+fn poke_ssh_agent() {
+    // SSH agent socket communication is Unix-specific
+}
+
 /// Disconnect from the YubiKey without resetting it.
 ///
 /// This can be used to preserve the YubiKey's PIN and touch caches. There are two cases
@@ -265,8 +334,13 @@ pub(crate) fn open(serial: Option<Serial>) -> Result<YubiKey, Error> {
 ///   YubiKey's state were to potentially cache the PIN and/or touch (depending on the
 ///   policies of the slot). We want to allow these to persist beyond our execution, for
 ///   usability.
+///
+/// After releasing the YubiKey, this function also sends a request to the SSH agent
+/// (if available) to trigger reconnection, allowing agents like `yubikey-agent` to
+/// reclaim the device and preserve PIN cache state.
 pub(crate) fn disconnect_without_reset(yubikey: YubiKey) {
     let _ = yubikey.disconnect(pcsc::Disposition::LeaveCard);
+    poke_ssh_agent();
 }
 
 fn request_pin<E, E2>(
@@ -383,6 +457,30 @@ pub(crate) fn manage(yubikey: &mut YubiKey) -> Result<(), Error> {
     Ok(())
 }
 
+/// Parses the certificate to identify the preferred recipient type it corresponds to.
+pub(crate) fn identify_recipient(cert: &Certificate) -> Option<Recipient> {
+    let known_oids = KNOWN_OIDS
+        .iter()
+        .map(|oid| Oid::from(oid).unwrap())
+        .collect::<Vec<_>>();
+
+    // If the certificate contains any unrecognised critical extensions, reject it: we
+    // don't know how to correctly use the identity. In particular, some identities store
+    // parts of their private key material in certificate extensions to work around
+    // hardware limitations. Not understanding these extensions could lead to encrypting
+    // with the wrong protocol and violating security assumptions.
+    let (_, c) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
+    if c.tbs_certificate
+        .extensions()
+        .iter()
+        .any(|ext| ext.critical && !known_oids.contains(&ext.oid))
+    {
+        return None;
+    }
+
+    p256tag::Recipient::from_certificate(cert).map(Recipient::P256Tag)
+}
+
 /// Returns an iterator of keys that are occupying plugin-compatible slots, along with the
 /// corresponding recipient if the key is compatible with this plugin.
 pub(crate) fn list_slots(
@@ -392,9 +490,7 @@ pub(crate) fn list_slots(
         // We only use the retired slots.
         match key.slot() {
             SlotId::Retired(slot) => {
-                // Only P-256 keys are compatible with us.
-                let recipient = piv_p256::Recipient::from_certificate(key.certificate())
-                    .map(Recipient::PivP256);
+                let recipient = identify_recipient(key.certificate());
                 Some((key, slot, recipient))
             }
             _ => None,
@@ -422,14 +518,9 @@ pub struct Stub {
 impl fmt::Display for Stub {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(
-            bech32::encode(
-                IDENTITY_PREFIX,
-                self.to_bytes().to_base32(),
-                Variant::Bech32,
-            )
-            .expect("HRP is valid")
-            .to_uppercase()
-            .as_str(),
+            bech32_encode(IDENTITY_PREFIX, &self.to_bytes())
+                .to_uppercase()
+                .as_str(),
         )
     }
 }
@@ -597,9 +688,10 @@ impl Stub {
         let (cert, pk) = match Certificate::read(&mut yubikey, SlotId::Retired(self.slot))
             .ok()
             .and_then(|cert| {
-                piv_p256::Recipient::from_certificate(&cert)
-                    .filter(|pk| pk.tag() == self.tag)
-                    .map(|pk| (cert, Recipient::PivP256(pk)))
+                // Parse as the preferred recipient for each identity type.
+                identify_recipient(&cert)
+                    .filter(|recipient| recipient.static_tag() == self.tag)
+                    .map(|r| (cert, r))
             }) {
             Some(pk) => pk,
             None => {
@@ -633,8 +725,13 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    /// Returns the preferred recipient for encrypting to this identity.
     pub(crate) fn recipient(&self) -> &Recipient {
         &self.pk
+    }
+
+    pub(crate) fn stub(&self) -> Stub {
+        Stub::new(self.yubikey.serial(), self.slot, &self.pk)
     }
 
     pub(crate) fn request_pin_if_necessary<E>(

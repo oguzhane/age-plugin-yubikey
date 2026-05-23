@@ -17,6 +17,7 @@ use yubikey::{piv::RetiredSlotId, reader::Context, PinPolicy, Serial, TouchPolic
 mod builder;
 mod error;
 mod key;
+mod native;
 mod piv_p256;
 mod plugin;
 mod util;
@@ -28,7 +29,7 @@ use error::Error;
 
 const PLUGIN_NAME: &str = "yubikey";
 const BINARY_NAME: &str = "age-plugin-yubikey";
-const IDENTITY_PREFIX: &str = "age-plugin-yubikey-";
+const IDENTITY_PREFIX: bech32::Hrp = bech32::Hrp::parse_unchecked("AGE-PLUGIN-YUBIKEY-");
 
 const USABLE_SLOTS: [RetiredSlotId; 20] = [
     RetiredSlotId::R1,
@@ -297,6 +298,12 @@ fn list(flags: PluginFlags, all: bool) -> Result<(), Error> {
         all,
         |_, recipient, metadata| {
             println!("{metadata}");
+            if let Some(legacy_recipient) = recipient.legacy_recipient(&metadata) {
+                println!(
+                    "{}",
+                    fl!("yubikey-legacy-recipient", recipient = legacy_recipient)
+                );
+            }
             println!("{recipient}");
         },
     )
@@ -402,7 +409,7 @@ fn main() -> Result<(), Error> {
                             let (_, cert) =
                                 x509_parser::parse_x509_certificate(key.certificate().as_ref())
                                     .unwrap();
-                            let (name, _) = util::extract_name(&cert, true).unwrap();
+                            let (name, _) = util::extract_name_and_version(&cert, true).unwrap();
                             let created = cert
                                 .validity()
                                 .not_before
@@ -612,6 +619,15 @@ fn main() -> Result<(), Error> {
             Err(e) => return Err(e.into()),
         };
 
+        let identity = if let Some(legacy_recipient) = recipient.legacy_recipient(&metadata) {
+            format!(
+                "{}\n{stub}",
+                fl!("yubikey-legacy-recipient", recipient = legacy_recipient),
+            )
+        } else {
+            stub.to_string()
+        };
+
         writeln!(
             file,
             "{}",
@@ -619,7 +635,7 @@ fn main() -> Result<(), Error> {
                 "yubikey-identity",
                 yubikey_metadata = metadata.to_string(),
                 recipient = recipient.to_string(),
-                identity = stub.to_string(),
+                identity = identity,
             )
         )?;
         file.sync_data()?;

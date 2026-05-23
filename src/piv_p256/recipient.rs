@@ -1,12 +1,11 @@
-use bech32::{ToBase32, Variant};
+use age_core::primitives::bech32_encode_to_fmt;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use yubikey::{certificate::PublicKeyInfo, Certificate};
 
 use std::fmt;
 
 use crate::recipient::{static_tag, TAG_BYTES};
 
-const RECIPIENT_PREFIX: &str = "age1yubikey";
+const RECIPIENT_PREFIX: bech32::Hrp = bech32::Hrp::parse_unchecked("age1yubikey");
 
 /// Wrapper around a compressed secp256r1 curve point.
 #[derive(Clone)]
@@ -20,15 +19,7 @@ impl fmt::Debug for Recipient {
 
 impl fmt::Display for Recipient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            bech32::encode(
-                RECIPIENT_PREFIX,
-                self.to_encoded().as_bytes().to_base32(),
-                Variant::Bech32,
-            )
-            .expect("HRP is valid")
-            .as_str(),
-        )
+        bech32_encode_to_fmt(f, RECIPIENT_PREFIX, self.to_encoded().as_bytes())
     }
 }
 
@@ -40,17 +31,6 @@ impl Recipient {
             Self::from_encoded(&encoded)
         } else {
             None
-        }
-    }
-
-    pub(crate) fn from_certificate(cert: &Certificate) -> Option<Self> {
-        Self::from_spki(cert.subject_pki())
-    }
-
-    pub(crate) fn from_spki(spki: &PublicKeyInfo) -> Option<Self> {
-        match spki {
-            PublicKeyInfo::EcP256(pubkey) => Self::from_encoded(pubkey),
-            _ => None,
         }
     }
 
